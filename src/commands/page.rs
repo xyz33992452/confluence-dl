@@ -17,9 +17,10 @@ use crate::cli::Cli;
 use crate::color::ColorScheme;
 use crate::commands::auth::load_credentials;
 use crate::confluence::{self, ConfluenceApi};
+use crate::events::{Event, EventSink, now_secs};
 use crate::format::OutputFormat;
 use crate::markdown::MarkdownOptions;
-use crate::processed_page::{ProcessOptions, process_page, write_processed_page};
+use crate::processed_page::{ProcessOptions, process_page, sanitize_filename, write_processed_page};
 
 /// Execute the primary page download workflow.
 ///
@@ -32,6 +33,18 @@ use crate::processed_page::{ProcessOptions, process_page, write_processed_page};
 /// * `cli` - Parsed CLI options controlling behavior, output, and auth.
 /// * `colors` - Shared color scheme for consistent terminal output.
 pub async fn handle_page_download(page_input: &str, cli: &Cli, colors: &ColorScheme) {
+  let sink = EventSink::to_stderr(cli.behavior.json_events);
+  sink.emit(Event {
+    kind: "started",
+    ts: now_secs(),
+    index: None,
+    total: None,
+    title: Some(page_input),
+    name: None,
+    path: Some(&cli.output.output),
+    message: None,
+    asset_kind: None,
+  });
   println!("{} {}", colors.progress("→"), colors.info("Downloading page"));
   println!("  {}: {}", colors.emphasis("URL"), colors.link(page_input));
   println!("  {}: {}", colors.emphasis("Output"), colors.path(&cli.output.output));
@@ -56,8 +69,8 @@ pub async fn handle_page_download(page_input: &str, cli: &Cli, colors: &ColorSch
     return;
   }
 
-  // Parse the input to extract page ID and base URL
-  if let Err(e) = download_page(page_input, cli, colors).await {
+  // Parse URL to extract page ID and base URL
+  if let Err(e) = download_page(page_input, cli, colors, &sink).await {
     eprintln!("{} {}", colors.error("✗"), colors.error("Failed to download page"));
     let mut chain = e.chain();
     if let Some(head) = chain.next() {
@@ -87,7 +100,7 @@ pub async fn handle_page_download(page_input: &str, cli: &Cli, colors: &ColorSch
 /// # Errors
 /// Returns an error when any network call, filesystem write, or conversion
 /// step fails.
-async fn download_page(page_input: &str, cli: &Cli, colors: &ColorScheme) -> anyhow::Result<()> {
+async fn download_page(page_input: &str, cli: &Cli, colors: &ColorScheme, sink: &EventSink) -> anyhow::Result<()> {
   // Parse URL to extract page ID and base URL
   let url_info = if page_input.contains("://") {
     // It's a URL
@@ -124,6 +137,10 @@ async fn download_page(page_input: &str, cli: &Cli, colors: &ColorScheme) -> any
     cli.performance.timeout,
     cli.performance.rate_limit,
   )?;
+  let client = match cli.performance.max_bandwidth_mb_s {
+    Some(limit) => client.with_max_bandwidth_mb_s(limit)?,
+    None => client,
+  };
 
   // Check if we should download children
   if cli.page.children {
@@ -137,6 +154,17 @@ async fn download_page(page_input: &str, cli: &Cli, colors: &ColorScheme) -> any
     let tree = confluence::get_page_tree(&client, &url_info.page_id, max_depth).await?;
 
     let total_pages = count_pages_in_tree(&tree);
+    sink.emit(Event {
+      kind: "tree",
+      ts: now_secs(),
+      index: None,
+      total: Some(total_pages),
+      title: Some(&tree.page.title),
+      name: None,
+      path: None,
+      message: None,
+      asset_kind: None,
+    });
     println!(
       "  {} Found {} {}",
       colors.success("✓"),
@@ -157,14 +185,37 @@ async fn download_page(page_input: &str, cli: &Cli, colors: &ColorScheme) -> any
     let output_dir = Path::new(&cli.output.output);
     let parallel_limit = cli.performance.resolved_parallel();
     let semaphore = Arc::new(Semaphore::new(parallel_limit));
-    download_page_tree(&client, &tree, output_dir, cli, colors, semaphore).await?;
+    download_page_tree(&client, &tree, output_dir, cli, colors, semaphore, sink).await?;
 
+    sink.emit(Event {
+      kind: "done",
+      ts: now_secs(),
+      index: Some(total_pages),
+      total: Some(total_pages),
+      title: None,
+      name: None,
+      path: None,
+      message: Some("ok"),
+      asset_kind: None,
+    });
     return Ok(());
   }
 
   // Fetch single page (non-children mode)
   println!("{} {}", colors.info("→"), colors.info("Fetching page content"));
   let page = client.get_page(&url_info.page_id).await?;
+
+  sink.emit(Event {
+    kind: "page_start",
+    ts: now_secs(),
+    index: Some(1),
+    total: Some(1),
+    title: Some(&page.title),
+    name: Some(&page.id),
+    path: None,
+    message: None,
+    asset_kind: None,
+  });
 
   println!("  {}: {}", colors.emphasis("Title"), colors.emphasis(&page.title));
   println!("  {}: {}", colors.emphasis("Type"), page.page_type);
@@ -182,6 +233,13 @@ async fn download_page(page_input: &str, cli: &Cli, colors: &ColorScheme) -> any
   }
 
   let output_dir = Path::new(&cli.output.output);
+  let expected_filename = format!(
+    "{}.{}",
+    sanitize_filename(&page.title),
+    cli.output.format.file_extension()
+  );
+  let expected_path = output_dir.join(expected_filename);
+  let page_already_exists = !cli.output.overwrite && expected_path.is_file();
 
   // Convert to target format
   let format_name = match cli.output.format {
@@ -244,6 +302,59 @@ async fn download_page(page_input: &str, cli: &Cli, colors: &ColorScheme) -> any
   let output_path = write_processed_page(&processed, output_dir, cli.output.format, cli.output.overwrite)?;
   println!("  {}: {}", colors.emphasis("File"), colors.path(output_path.display()));
 
+  sink.emit(Event {
+    kind: if page_already_exists {
+      "page_skipped"
+    } else {
+      "page_done"
+    },
+    ts: now_secs(),
+    index: Some(1),
+    total: Some(1),
+    title: Some(&page.title),
+    name: None,
+    path: Some(output_path.to_str().unwrap_or("")),
+    message: page_already_exists.then_some("already exists"),
+    asset_kind: None,
+  });
+  for image in &processed.images {
+    sink.emit(Event {
+      kind: "asset",
+      ts: now_secs(),
+      index: None,
+      total: None,
+      title: None,
+      name: Some(image.relative_path.to_str().unwrap_or("")),
+      path: None,
+      message: None,
+      asset_kind: Some("image"),
+    });
+  }
+  for attachment in &processed.attachments {
+    sink.emit(Event {
+      kind: "asset",
+      ts: now_secs(),
+      index: None,
+      total: None,
+      title: None,
+      name: Some(attachment.relative_path.to_str().unwrap_or("")),
+      path: None,
+      message: None,
+      asset_kind: Some("attachment"),
+    });
+  }
+  sink.emit(Event {
+    kind: "done",
+    ts: now_secs(),
+    index: Some(1),
+    total: Some(1),
+    title: None,
+    name: None,
+    path: None,
+    message: Some("ok"),
+    asset_kind: None,
+  });
+
   Ok(())
 }
 
@@ -275,6 +386,7 @@ fn download_page_tree<'a>(
   cli: &'a Cli,
   colors: &'a ColorScheme,
   semaphore: Arc<Semaphore>,
+  sink: &'a EventSink,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a + Send>> {
   Box::pin(async move {
     let permit = semaphore
@@ -285,6 +397,18 @@ fn download_page_tree<'a>(
 
     let page = &tree.page;
 
+    sink.emit(Event {
+      kind: "page_start",
+      ts: now_secs(),
+      index: None,
+      total: None,
+      title: Some(&page.title),
+      name: Some(&page.id),
+      path: None,
+      message: None,
+      asset_kind: None,
+    });
+
     if cli.behavior.verbose > 0 {
       println!(
         "{}   {} {}",
@@ -294,7 +418,11 @@ fn download_page_tree<'a>(
       );
     }
 
-    // Process the page (API calls + conversion)
+    let page_filename = sanitize_filename(&page.title);
+    let expected_path = output_dir.join(format!("{}.{}", page_filename, cli.output.format.file_extension()));
+    let page_already_exists = !cli.output.overwrite && expected_path.is_file();
+
+    // Process missing assets even when the page file already exists.
     let process_options = build_process_options(cli, output_dir);
     let processed = process_page(client, page, &process_options).await?;
 
@@ -308,10 +436,61 @@ fn download_page_tree<'a>(
       println!("    {}", colors.dimmed("No attachments found"));
     }
 
-    // Write processed page to disk (I/O phase)
+    // Write processed page and any missing assets to disk.
     let output_path = write_processed_page(&processed, output_dir, cli.output.format, cli.output.overwrite)?;
 
-    if !cli.behavior.quiet {
+    sink.emit(Event {
+      kind: if page_already_exists {
+        "page_skipped"
+      } else {
+        "page_done"
+      },
+      ts: now_secs(),
+      index: None,
+      total: None,
+      title: Some(&page.title),
+      name: None,
+      path: Some(output_path.to_str().unwrap_or("")),
+      message: page_already_exists.then_some("already exists"),
+      asset_kind: None,
+    });
+
+    // Emit asset events for images and attachments so the UI can show
+    // granular progress even when pages are processed concurrently.
+    for image in &processed.images {
+      sink.emit(Event {
+        kind: "asset",
+        ts: now_secs(),
+        index: None,
+        total: None,
+        title: None,
+        name: Some(image.relative_path.to_str().unwrap_or("")),
+        path: None,
+        message: None,
+        asset_kind: Some("image"),
+      });
+    }
+    for attachment in &processed.attachments {
+      sink.emit(Event {
+        kind: "asset",
+        ts: now_secs(),
+        index: None,
+        total: None,
+        title: None,
+        name: Some(attachment.relative_path.to_str().unwrap_or("")),
+        path: None,
+        message: None,
+        asset_kind: Some("attachment"),
+      });
+    }
+
+    if page_already_exists {
+      println!(
+        "  {} Keeping existing page file: {}",
+        colors.dimmed("↷"),
+        colors.path(output_path.display())
+      );
+    } else if !cli.behavior.quiet {
       println!("  {} {}", colors.success("✓"), colors.path(output_path.display()));
     }
 
@@ -321,14 +500,21 @@ fn download_page_tree<'a>(
     // Download child pages recursively
     if !tree.children.is_empty() {
       // Create subdirectory for children
-      let child_dir = output_dir.join(&processed.filename);
+      let child_dir = output_dir.join(page_filename);
       fs::create_dir_all(&child_dir)
         .with_context(|| format!("Failed to create directory for child pages at {}", child_dir.display()))?;
 
-      let child_futures = tree
-        .children
-        .iter()
-        .map(|child_tree| download_page_tree(client, child_tree, &child_dir, cli, colors, Arc::clone(&semaphore)));
+      let child_futures = tree.children.iter().map(|child_tree| {
+        download_page_tree(
+          client,
+          child_tree,
+          &child_dir,
+          cli,
+          colors,
+          Arc::clone(&semaphore),
+          sink,
+        )
+      });
 
       for result in join_all(child_futures).await {
         result?;
@@ -576,6 +762,7 @@ mod tests {
         verbose: 0,
         quiet: true,
         color: ColorOption::Never,
+        json_events: false,
       },
       page: PageOptions {
         children: true,
@@ -591,17 +778,102 @@ mod tests {
         parallel: 2,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
     let semaphore = Arc::new(Semaphore::new(cli.performance.resolved_parallel()));
-    download_page_tree(&client, &tree, output_dir, &cli, &colors, semaphore)
-      .await
-      .expect("download should succeed");
+    download_page_tree(
+      &client,
+      &tree,
+      output_dir,
+      &cli,
+      &colors,
+      semaphore,
+      &EventSink::to_stderr(false),
+    )
+    .await
+    .expect("download should succeed");
 
     let raw_file = output_dir.join("Root Page.raw.xml");
     assert!(raw_file.exists(), "raw storage file should be created");
     assert_eq!(fs::read_to_string(&raw_file).unwrap(), "<p>Example</p>");
+  }
+
+  #[tokio::test]
+  async fn download_page_tree_skips_existing_pages_and_continues_into_children() {
+    let temp_dir = tempdir().unwrap();
+    let output_dir = temp_dir.path();
+    let root_file = output_dir.join("Root Page.md");
+    fs::write(&root_file, "keep my existing copy").unwrap();
+
+    let tree = PageTree {
+      page: make_page("root", "Root Page"),
+      children: vec![PageTree {
+        page: make_page("child", "Child Page"),
+        children: Vec::new(),
+        depth: 1,
+      }],
+      depth: 0,
+    };
+    let counter = Arc::new(Mutex::new(0));
+    let max_counter = Arc::new(Mutex::new(0));
+    let client = CountingClient::new(counter, max_counter, Duration::from_millis(1));
+    let colors = ColorScheme::new(ColorOption::Never);
+    let cli = Cli {
+      page_input: None,
+      command: None,
+      auth: AuthOptions {
+        url: None,
+        user: None,
+        token: None,
+      },
+      output: OutputOptions {
+        output: output_dir.to_string_lossy().to_string(),
+        overwrite: false,
+        save_raw: false,
+        compact_tables: false,
+        format: OutputFormat::Markdown,
+      },
+      behavior: BehaviorOptions {
+        dry_run: false,
+        verbose: 0,
+        quiet: true,
+        color: ColorOption::Never,
+        json_events: false,
+      },
+      page: PageOptions {
+        children: true,
+        max_depth: None,
+        attachments: false,
+      },
+      images_links: ImagesLinksOptions {
+        download_images: false,
+        images_dir: "images".to_string(),
+        preserve_anchors: false,
+      },
+      performance: PerformanceOptions {
+        parallel: 2,
+        rate_limit: 10,
+        timeout: 30,
+        max_bandwidth_mb_s: None,
+      },
+    };
+
+    download_page_tree(
+      &client,
+      &tree,
+      output_dir,
+      &cli,
+      &colors,
+      Arc::new(Semaphore::new(2)),
+      &EventSink::to_stderr(false),
+    )
+    .await
+    .expect("existing pages should be skipped without stopping child downloads");
+
+    assert_eq!(fs::read_to_string(&root_file).unwrap(), "keep my existing copy");
+    assert!(output_dir.join("Root Page/Child Page.md").exists());
   }
 
   #[tokio::test]
@@ -649,6 +921,7 @@ mod tests {
         verbose: 0,
         quiet: true,
         color: ColorOption::Never,
+        json_events: false,
       },
       page: PageOptions {
         children: true,
@@ -664,14 +937,23 @@ mod tests {
         parallel: 2,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
     let limit = cli.performance.resolved_parallel();
     let semaphore = Arc::new(Semaphore::new(limit));
-    download_page_tree(&client, &tree, output_path, &cli, &colors, semaphore)
-      .await
-      .expect("download should succeed");
+    download_page_tree(
+      &client,
+      &tree,
+      output_path,
+      &cli,
+      &colors,
+      semaphore,
+      &EventSink::to_stderr(false),
+    )
+    .await
+    .expect("download should succeed");
 
     let max = *max_counter.lock().await;
     assert!(max <= limit, "observed concurrency {max} exceeds limit {}", limit);

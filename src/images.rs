@@ -13,6 +13,7 @@ use roxmltree::{Document, Node};
 const SYNTHETIC_NS_BASE: &str = "https://confluence.example/";
 
 use crate::confluence::ConfluenceApi;
+use crate::markdown::html_entities::preprocess_html_entities;
 
 /// Information about an image found in Confluence content
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,8 +35,8 @@ pub struct ImageReference {
 /// # Returns
 /// A vector of [`ImageReference`] values describing discovered images.
 pub fn extract_image_references(storage_content: &str) -> Result<Vec<ImageReference>> {
-  // Pre-process: Replace HTML entities with Unicode characters
-  // roxmltree only supports XML's 5 predefined entities, not HTML entities
+  // Reuse the complete entity decoder from the Markdown parser so both
+  // conversion and image discovery accept the same Confluence storage.
   let preprocessed = preprocess_html_entities(storage_content);
   let wrapped = wrap_with_namespaces(&preprocessed);
   let document = Document::parse(&wrapped).context("Failed to parse Confluence storage content for images")?;
@@ -207,45 +208,6 @@ fn is_valid_prefix(prefix: &str) -> bool {
   prefix
     .chars()
     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-/// Replaces common HTML entities with Unicode characters before XML parsing.
-///
-/// `roxmltree` only recognizes XML's predefined entities (`&lt;`, `&gt;`,
-/// `&amp;`, `&quot;`, `&apos;`). Confluence storage content frequently includes
-/// the broader HTML entity set, so we normalize them before parsing.
-///
-/// # Arguments
-/// * `text` - Raw storage format markup that may contain HTML entities.
-///
-/// # Returns
-/// A `String` with known HTML entities replaced by their Unicode equivalents.
-fn preprocess_html_entities(text: &str) -> String {
-  text
-    .replace("&nbsp;", "\u{00A0}") // non-breaking space
-    .replace("&ndash;", "\u{2013}") // en dash
-    .replace("&mdash;", "\u{2014}") // em dash
-    .replace("&ldquo;", "\u{201C}") // left double quote
-    .replace("&rdquo;", "\u{201D}") // right double quote
-    .replace("&lsquo;", "\u{2018}") // left single quote
-    .replace("&rsquo;", "\u{2019}") // right single quote
-    .replace("&hellip;", "\u{2026}") // horizontal ellipsis
-    .replace("&bull;", "\u{2022}") // bullet
-    .replace("&middot;", "\u{00B7}") // middle dot
-    .replace("&deg;", "\u{00B0}") // degree sign
-    .replace("&copy;", "\u{00A9}") // copyright
-    .replace("&reg;", "\u{00AE}") // registered trademark
-    .replace("&trade;", "\u{2122}") // trademark
-    .replace("&times;", "\u{00D7}") // multiplication sign
-    .replace("&divide;", "\u{00F7}") // division sign
-    .replace("&plusmn;", "\u{00B1}") // plus-minus sign
-    .replace("&ne;", "\u{2260}") // not equal
-    .replace("&le;", "\u{2264}") // less than or equal
-    .replace("&ge;", "\u{2265}") // greater than or equal
-    .replace("&larr;", "\u{2190}") // leftwards arrow
-    .replace("&rarr;", "\u{2192}") // rightwards arrow
-    .replace("&uarr;", "\u{2191}") // upwards arrow
-    .replace("&darr;", "\u{2193}") // downwards arrow
 }
 
 /// Downloads images referenced in page content and writes them to disk.
@@ -500,6 +462,18 @@ mod tests {
     let refs = extract_image_references(storage).unwrap();
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].alt_text, "image");
+  }
+
+  #[test]
+  fn test_extract_image_references_with_math_entity_in_content() {
+    let storage = r#"
+      <p>Limit approaches infinity: &infin;</p>
+      <ac:image><ri:attachment ri:filename="diagram.png" /></ac:image>
+    "#;
+
+    let refs = extract_image_references(storage).unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].filename, "diagram.png");
   }
 
   #[test]

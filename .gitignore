@@ -25,3 +25,7 @@ lcov.info
 
 # Outputs from confluence-dl
 confluence-export/
+
+# Web UI launcher runtime state and virtualenv
+.venv-web/
+.runtime/

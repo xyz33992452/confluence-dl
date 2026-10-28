@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use super::api::ConfluenceApi;
-use super::models::{Attachment, AttachmentsResponse, ChildPagesResponse, Page, UserInfo};
+use super::models::{Attachment, AttachmentsResponse, ChildPagesV2Response, Page, UserInfo};
 
 /// Maximum number of pagination requests before aborting, as a safeguard
 /// against infinite loops caused by cyclic or malformed `next` links.
@@ -26,6 +26,7 @@ pub struct ConfluenceClient {
   token: String,
   client: reqwest::Client,
   rate_limiter: Arc<RequestRateLimiter>,
+  bandwidth_limiter: Option<Arc<BandwidthLimiter>>,
 }
 
 /// Simple fixed-window rate limiter to cap the number of requests per interval.
@@ -91,6 +92,42 @@ impl RequestRateLimiter {
   }
 }
 
+/// Serializes byte budgets across concurrent file downloads.
+#[derive(Debug)]
+struct BandwidthLimiter {
+  bytes_per_second: f64,
+  next_available: Mutex<Instant>,
+}
+
+impl BandwidthLimiter {
+  fn new(bytes_per_second: f64) -> Self {
+    Self {
+      bytes_per_second,
+      next_available: Mutex::new(Instant::now()),
+    }
+  }
+
+  async fn acquire(&self, bytes: usize) {
+    if bytes == 0 {
+      return;
+    }
+
+    let wait = {
+      let mut next_available = self.next_available.lock().await;
+      let now = Instant::now();
+      let start = (*next_available).max(now);
+      let seconds = bytes as f64 / self.bytes_per_second;
+      let ready = start + Duration::from_secs_f64(seconds);
+      *next_available = ready;
+      ready.saturating_duration_since(now)
+    };
+
+    if !wait.is_zero() {
+      sleep(wait).await;
+    }
+  }
+}
+
 impl ConfluenceClient {
   /// Create a new Confluence client.
   ///
@@ -141,7 +178,23 @@ impl ConfluenceClient {
       token,
       client,
       rate_limiter: Arc::new(RequestRateLimiter::new(rate_limit, Duration::from_secs(1))),
+      bandwidth_limiter: None,
     })
+  }
+
+  /// Apply a shared maximum rate to all downloaded file bodies.
+  pub fn with_max_bandwidth_mb_s(mut self, limit: f64) -> Result<Self> {
+    if !limit.is_finite() || limit < 0.001 {
+      return Err(anyhow!("Maximum bandwidth must be at least 0.001 MB/s"));
+    }
+
+    let bytes_per_second = limit * 1_000_000.0;
+    if !bytes_per_second.is_finite() {
+      return Err(anyhow!("Maximum bandwidth is too large"));
+    }
+
+    self.bandwidth_limiter = Some(Arc::new(BandwidthLimiter::new(bytes_per_second)));
+    Ok(self)
   }
 
   /// Get the authorization header value (Basic auth).
@@ -192,7 +245,7 @@ impl ConfluenceApi for ConfluenceClient {
   }
 
   async fn get_child_pages(&self, page_id: &str) -> Result<Vec<Page>> {
-    let initial_url = format!("{}/wiki/rest/api/content/{}/child/page", self.base_url, page_id);
+    let initial_url = format!("{}/wiki/api/v2/pages/{}/children?limit=100", self.base_url, page_id);
     let mut all_pages = Vec::new();
     let mut next_url = Some(initial_url);
     let mut seen_urls = HashSet::new();
@@ -230,12 +283,12 @@ impl ConfluenceApi for ConfluenceClient {
         return Err(anyhow!("Confluence API returned error {status}: {error_text}"));
       }
 
-      let child_pages: ChildPagesResponse = response
+      let child_pages: ChildPagesV2Response = response
         .json()
         .await
-        .context("Failed to parse child pages response from Confluence API")?;
+        .context("Failed to parse child pages response from Confluence REST API v2")?;
 
-      all_pages.extend(child_pages.results);
+      all_pages.extend(child_pages.results.into_iter().map(Page::from));
       next_url = child_pages
         .links
         .and_then(|l| l.next)
@@ -246,7 +299,7 @@ impl ConfluenceApi for ConfluenceClient {
   }
 
   async fn get_attachments(&self, page_id: &str) -> Result<Vec<Attachment>> {
-    let initial_url = format!("{}/wiki/rest/api/content/{}/child/attachment", self.base_url, page_id);
+    let initial_url = format!("{}/wiki/api/v2/pages/{}/attachments?limit=100", self.base_url, page_id);
     let mut all_attachments = Vec::new();
     let mut next_url = Some(initial_url);
     let mut seen_urls = HashSet::new();
@@ -339,8 +392,15 @@ impl ConfluenceApi for ConfluenceClient {
       ));
     }
 
-    let bytes = response.bytes().await.context("Failed to read attachment bytes")?;
-    Ok(bytes.to_vec())
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("Failed to read attachment bytes")? {
+      if let Some(limiter) = &self.bandwidth_limiter {
+        limiter.acquire(chunk.len()).await;
+      }
+      bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
   }
 
   async fn test_auth(&self) -> Result<UserInfo> {
@@ -398,6 +458,10 @@ impl ConfluenceClient {
       return format!("{}{}", self.base_url, url);
     }
 
+    if url.starts_with("/rest/") {
+      return format!("{}/wiki{}", self.base_url, url);
+    }
+
     if url.starts_with("/download/") {
       return format!("{}/wiki{}", self.base_url, url);
     }
@@ -408,8 +472,6 @@ impl ConfluenceClient {
 
 #[cfg(test)]
 mod tests {
-  use base64::Engine as _;
-
   use super::*;
 
   #[test]
@@ -471,6 +533,128 @@ mod tests {
     );
   }
 
+  #[tokio::test]
+  async fn get_child_pages_uses_cloud_v2_children_endpoint() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+      let (mut stream, _) = listener.accept().unwrap();
+      let mut request = [0_u8; 2048];
+      let len = stream.read(&mut request).unwrap();
+      let request = String::from_utf8_lossy(&request[..len]).to_string();
+      let body = r#"{"results":[{"id":"42","title":"Child page","status":"current","spaceId":"11","childPosition":0}],"_links":{}}"#;
+      write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+      )
+      .unwrap();
+      request
+    });
+
+    let client = ConfluenceClient::new(format!("http://{address}"), "user", "token", 30, 10).unwrap();
+    let pages = client.get_child_pages("100").await.unwrap();
+    let request = server.join().unwrap();
+
+    assert!(request.starts_with("GET /wiki/api/v2/pages/100/children?limit=100 HTTP/1.1"));
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].id, "42");
+    assert_eq!(pages[0].page_type, "page");
+  }
+
+  #[tokio::test]
+  async fn get_attachments_uses_cloud_v2_attachments_endpoint() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+      let (mut stream, _) = listener.accept().unwrap();
+      let mut request = [0_u8; 2048];
+      let len = stream.read(&mut request).unwrap();
+      let request = String::from_utf8_lossy(&request[..len]).to_string();
+      let body = r#"{"results":[{"id":"attachment-1","title":"image.png","status":"current","mediaType":"image/png","fileSize":123,"_links":{"download":"/wiki/download/attachments/1/image.png"}}],"_links":{}}"#;
+      write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+      )
+      .unwrap();
+      request
+    });
+
+    let client = ConfluenceClient::new(format!("http://{address}"), "user", "token", 30, 10).unwrap();
+    let attachments = client.get_attachments("100").await.unwrap();
+    let request = server.join().unwrap();
+
+    assert!(request.starts_with("GET /wiki/api/v2/pages/100/attachments?limit=100 HTTP/1.1"));
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].attachment_type, "attachment");
+  }
+
+  #[tokio::test]
+  async fn bandwidth_limiter_caps_aggregate_transfer_rate() {
+    let limiter = Arc::new(BandwidthLimiter::new(50_000.0));
+    let start = Instant::now();
+
+    tokio::join!(limiter.acquire(25_000), limiter.acquire(25_000));
+
+    assert!(
+      start.elapsed() >= Duration::from_millis(900),
+      "two concurrent transfers should share the 50 KB/s cap; got {:?}",
+      start.elapsed()
+    );
+  }
+
+  #[tokio::test]
+  async fn attachment_download_obeys_bandwidth_limit() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+      let (mut stream, _) = listener.accept().unwrap();
+      let mut request = [0_u8; 1024];
+      let _ = stream.read(&mut request);
+      let body = vec![b'x'; 10_000];
+      write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+      )
+      .unwrap();
+      stream.write_all(&body).unwrap();
+    });
+
+    let client = ConfluenceClient::new("https://example.atlassian.net", "user", "token", 30, 10)
+      .unwrap()
+      .with_max_bandwidth_mb_s(0.01)
+      .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("attachment.bin");
+    let start = Instant::now();
+
+    client
+      .download_attachment(&format!("http://{address}/attachment"), &output)
+      .await
+      .unwrap();
+
+    assert!(
+      start.elapsed() >= Duration::from_millis(900),
+      "10 KB at 0.01 MB/s should take at least 0.9s; got {:?}",
+      start.elapsed()
+    );
+    assert_eq!(tokio::fs::read(output).await.unwrap().len(), 10_000);
+    server.join().unwrap();
+  }
+
   #[test]
   fn resolve_attachment_url_handles_absolute_urls() {
     let client =
@@ -501,6 +685,18 @@ mod tests {
     assert_eq!(
       client.resolve_attachment_url(relative),
       "https://example.atlassian.net/wiki/download/attachments/12345/image.png"
+    );
+  }
+
+  #[test]
+  fn resolve_attachment_url_adds_wiki_context_to_rest_links() {
+    let client =
+      ConfluenceClient::new("https://example.atlassian.net", "user@example.com", "test-token", 30, 5).unwrap();
+    let relative = "/rest/api/content/12345/child/attachment/att-678/download";
+
+    assert_eq!(
+      client.resolve_attachment_url(relative),
+      "https://example.atlassian.net/wiki/rest/api/content/12345/child/attachment/att-678/download"
     );
   }
 

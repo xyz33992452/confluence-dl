@@ -176,6 +176,10 @@ pub struct BehaviorOptions {
   /// Colorize output
   #[arg(long, value_enum, default_value = "auto", value_name = "WHEN")]
   pub color: ColorOption,
+
+  /// Emit structured JSON Lines progress events to stderr (for UI frontends)
+  #[arg(long)]
+  pub json_events: bool,
 }
 
 /// Color output options
@@ -238,6 +242,10 @@ pub struct PerformanceOptions {
   /// Request timeout in seconds
   #[arg(long, default_value = "30", value_name = "SECONDS")]
   pub timeout: u64,
+
+  /// Maximum aggregate file download bandwidth in decimal megabytes per second
+  #[arg(long, value_name = "MB_PER_SEC")]
+  pub max_bandwidth_mb_s: Option<f64>,
 }
 
 impl PerformanceOptions {
@@ -306,6 +314,12 @@ impl Cli {
 
     if self.performance.rate_limit == 0 {
       return Err("--rate-limit must be at least 1 request per second".to_string());
+    }
+
+    if let Some(limit) = self.performance.max_bandwidth_mb_s
+      && (!limit.is_finite() || limit < 0.001)
+    {
+      return Err("--max-bandwidth-mb-s must be finite and at least 0.001 MB/s".to_string());
     }
 
     Ok(())
@@ -413,6 +427,7 @@ mod tests {
         verbose: 0,
         quiet: false,
         color: ColorOption::Auto,
+        json_events: false,
       },
       page: PageOptions {
         children: false,
@@ -428,6 +443,7 @@ mod tests {
         parallel: 4,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
@@ -462,6 +478,7 @@ mod tests {
         verbose: 0,
         quiet: false,
         color: ColorOption::Auto,
+        json_events: false,
       },
       page: PageOptions {
         children: false,
@@ -477,6 +494,7 @@ mod tests {
         parallel: 4,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
@@ -511,6 +529,7 @@ mod tests {
         verbose: 0,
         quiet: false,
         color: ColorOption::Auto,
+        json_events: false,
       },
       page: PageOptions {
         children: false,
@@ -526,6 +545,7 @@ mod tests {
         parallel: 4,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
@@ -556,6 +576,7 @@ mod tests {
         verbose: 0,
         quiet: false,
         color: ColorOption::Auto,
+        json_events: false,
       },
       page: PageOptions {
         children: false,
@@ -571,6 +592,7 @@ mod tests {
         parallel: 0,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
@@ -601,6 +623,7 @@ mod tests {
         verbose: 0,
         quiet: false,
         color: ColorOption::Auto,
+        json_events: false,
       },
       page: PageOptions {
         children: false,
@@ -616,6 +639,7 @@ mod tests {
         parallel: -1,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
@@ -644,6 +668,7 @@ mod tests {
         verbose: 0,
         quiet: false,
         color: ColorOption::Auto,
+        json_events: false,
       },
       page: PageOptions {
         children: false,
@@ -659,6 +684,7 @@ mod tests {
         parallel: -2,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
@@ -704,6 +730,7 @@ mod tests {
         verbose: 0,
         quiet: false,
         color: ColorOption::Auto,
+        json_events: false,
       },
       page: PageOptions {
         children: false,
@@ -719,6 +746,7 @@ mod tests {
         parallel: 4,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
@@ -751,6 +779,7 @@ mod tests {
         verbose: 0,
         quiet: false,
         color: ColorOption::Auto,
+        json_events: false,
       },
       page: PageOptions {
         children: false,
@@ -766,6 +795,7 @@ mod tests {
         parallel: 4,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
@@ -795,6 +825,7 @@ mod tests {
         verbose: 0,
         quiet: false,
         color: ColorOption::Auto,
+        json_events: false,
       },
       page: PageOptions {
         children: false,
@@ -810,6 +841,7 @@ mod tests {
         parallel: 4,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
@@ -839,6 +871,7 @@ mod tests {
         verbose: 0,
         quiet: false,
         color: ColorOption::Auto,
+        json_events: false,
       },
       page: PageOptions {
         children: true,
@@ -854,6 +887,7 @@ mod tests {
         parallel: 4,
         rate_limit: 10,
         timeout: 30,
+        max_bandwidth_mb_s: None,
       },
     };
 
@@ -919,5 +953,35 @@ mod tests {
     unsafe {
       env::remove_var("CONFLUENCE_URL");
     }
+  }
+
+  #[test]
+  fn test_cli_parses_max_bandwidth_in_megabytes_per_second() {
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from([
+      "confluence-dl",
+      "--max-bandwidth-mb-s",
+      "0.75",
+      "https://example.com/wiki/pages/123",
+    ])
+    .unwrap();
+
+    assert_eq!(cli.performance.max_bandwidth_mb_s, Some(0.75));
+  }
+
+  #[test]
+  fn test_cli_rejects_nonpositive_max_bandwidth() {
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from([
+      "confluence-dl",
+      "--max-bandwidth-mb-s",
+      "0",
+      "https://example.com/wiki/pages/123",
+    ])
+    .unwrap();
+
+    assert!(cli.validate().unwrap_err().contains("--max-bandwidth-mb-s"));
   }
 }

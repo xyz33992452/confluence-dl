@@ -473,12 +473,7 @@ fn write_file(path: &Path, content: &[u8], overwrite: bool) -> Result<()> {
           .write_all(content)
           .with_context(|| format!("Failed to write {}", path.display()))?;
       }
-      Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-        bail!(
-          "File already exists: {}. Use --overwrite to replace it.",
-          path.display()
-        );
-      }
+      Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
       Err(err) => {
         bail!("Failed to create file {}: {}", path.display(), err);
       }
@@ -570,15 +565,15 @@ mod tests {
   }
 
   #[test]
-  fn test_write_file_fails_without_overwrite() {
+  fn test_write_file_skips_existing_without_overwrite() {
     let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("existing.txt");
 
     fs::write(&file_path, "original").unwrap();
 
-    let result = write_file(&file_path, b"new content", false);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("already exists"));
+    write_file(&file_path, b"new content", false).unwrap();
+
+    assert_eq!(fs::read_to_string(&file_path).unwrap(), "original");
   }
 
   #[test]

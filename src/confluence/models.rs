@@ -80,7 +80,7 @@ pub struct Attachment {
   pub id: String,
   /// Original filename/title displayed in Confluence.
   pub title: String,
-  #[serde(rename = "type")]
+  #[serde(rename = "type", default = "default_attachment_type")]
   /// Attachment content type (usually `"attachment"`).
   pub attachment_type: String,
   #[serde(rename = "mediaType")]
@@ -132,6 +132,42 @@ pub struct ChildPagesResponse {
   /// Pagination links for traversing result pages.
   #[serde(rename = "_links")]
   pub links: Option<PaginationLinks>,
+}
+
+/// Minimal child-page record returned by the Confluence Cloud REST API v2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildPageV2 {
+  pub id: String,
+  pub title: String,
+  pub status: String,
+}
+
+impl From<ChildPageV2> for Page {
+  fn from(child: ChildPageV2) -> Self {
+    Self {
+      id: child.id,
+      title: child.title,
+      page_type: "page".to_string(),
+      status: child.status,
+      body: None,
+      space: None,
+      links: None,
+    }
+  }
+}
+
+/// Child-page response wrapper returned by REST API v2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildPagesV2Response {
+  pub results: Vec<ChildPageV2>,
+  #[serde(default)]
+  pub size: usize,
+  #[serde(rename = "_links")]
+  pub links: Option<PaginationLinks>,
+}
+
+fn default_attachment_type() -> String {
+  "attachment".to_string()
 }
 
 /// User information from authentication test.
@@ -222,5 +258,46 @@ mod tests {
     assert_eq!(response.results.len(), 1);
     let next = response.links.unwrap().next.unwrap();
     assert!(next.contains("start=25"));
+  }
+
+  #[test]
+  fn v2_attachment_response_defaults_missing_content_type() {
+    let json = serde_json::json!({
+      "results": [{
+        "id": "attachment-1",
+        "title": "image.png",
+        "status": "current",
+        "mediaType": "image/png",
+        "fileSize": 123,
+        "_links": {"download": "/wiki/download/attachments/1/image.png"}
+      }],
+      "_links": {}
+    });
+
+    let response: AttachmentsResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(response.results[0].attachment_type, "attachment");
+  }
+
+  #[test]
+  fn v2_child_pages_response_deserializes_and_maps_page_metadata() {
+    let json = serde_json::json!({
+      "results": [{
+        "id": "42",
+        "title": "Child page",
+        "status": "current",
+        "spaceId": "11",
+        "childPosition": 0
+      }],
+      "_links": {"next": "/wiki/api/v2/pages/1/children?cursor=next"}
+    });
+
+    let response: ChildPagesV2Response = serde_json::from_value(json).unwrap();
+    assert_eq!(response.results.len(), 1);
+    let page: Page = response.results.into_iter().next().unwrap().into();
+    assert_eq!(page.id, "42");
+    assert_eq!(page.title, "Child page");
+    assert_eq!(page.page_type, "page");
+    assert_eq!(page.status, "current");
+    assert!(response.links.unwrap().next.unwrap().contains("cursor=next"));
   }
 }

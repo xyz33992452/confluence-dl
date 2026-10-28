@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>confluence-dl 控制台</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161922;
+    --panel-2: #1d2230;
+    --border: #2a3043;
+    --fg: #e6e9f0;
+    --muted: #9aa3b8;
+    --accent: #6ea8fe;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --code: #f0c674;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    min-height: 100vh;
+    padding: 32px 16px;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 {
+    margin: 0 0 6px;
+    font-size: 22px;
+    letter-spacing: 0.5px;
+  }
+  .sub {
+    color: var(--muted);
+    margin-bottom: 24px;
+    font-size: 13px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+  }
+  .row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
+  label {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
+    margin: 6px 0 4px;
+    letter-spacing: 0.3px;
+  }
+  input[type="text"], input[type="password"], input[type="url"], input[type="number"] {
+    width: 100%;
+    background: var(--panel-2);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 14px;
+    font-family: inherit;
+  }
+  input:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
+  .opts {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    margin-top: 8px;
+    flex-wrap: wrap;
+  }
+  .opts label.check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--fg);
+    font-size: 13px;
+    margin: 0;
+  }
+  .opts input[type="number"] {
+    width: 80px;
+  }
+  .field-label-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 6px 0 4px;
+  }
+  .field-label-row label { margin: 0; }
+  a.secondary {
+    display: inline-block;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .token-help {
+    margin: 5px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  button {
+    background: var(--accent);
+    color: #0a0a0a;
+    border: none;
+    border-radius: 6px;
+    padding: 9px 18px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+  button.secondary {
+    background: var(--panel-2);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    font-weight: 500;
+    padding: 5px 9px;
+    font-size: 12px;
+  }
+  .actions { display: flex; gap: 12px; align-items: center; margin-top: 14px; }
+  .save-note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .save-note button { margin-left: 8px; }
+  .status {
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .status.error { color: var(--err); }
+  .status.ok { color: var(--ok); }
+  .progress {
+    height: 8px;
+    background: var(--panel-2);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 8px 0 6px;
+  }
+  .progress-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--accent), #8c5cf7);
+    transition: width 0.25s ease;
+  }
+  .counters {
+    display: flex;
+    gap: 18px;
+    font-size: 13px;
+    color: var(--muted);
+    flex-wrap: wrap;
+  }
+  .counters b { color: var(--fg); font-weight: 600; }
+  .log {
+    background: #0a0d12;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.55;
+    max-height: 360px;
+    overflow: auto;
+    color: var(--fg);
+  }
+  .log .evt { color: var(--accent); }
+  .log .err { color: var(--err); }
+  .log .warn { color: var(--warn); }
+  .log .ts { color: var(--muted); margin-right: 6px; }
+  .pill {
+    display: inline-block;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 8px;
+    font-size: 11px;
+    margin-left: 8px;
+    color: var(--muted);
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--code); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>confluence-dl 控制台</h1>
+  <div class="sub">填写 Confluence 凭据与目标页面，运行后实时显示页数 / 资源数 / 进度。</div>
+
+  <div class="card">
+    <form id="runForm">
+      <label>Confluence 站点地址（例：<code>https://example.atlassian.net</code>）</label>
+      <input type="url" name="site" required placeholder="https://example.atlassian.net">
+
+      <div class="row">
+        <div>
+          <label>登录邮箱</label>
+          <input type="text" name="user" required placeholder="you@example.com">
+        </div>
+        <div>
+          <div class="field-label-row">
+            <label for="apiToken">API Token</label>
+            <a class="secondary" href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noopener noreferrer">获取 API Token</a>
+          </div>
+          <input id="apiToken" type="password" name="token" required placeholder="Atlassian API token">
+          <p class="token-help">登录 Atlassian 后创建并复制 Token，返回此页粘贴到这里。Token 创建后只显示一次；请勿使用或粘贴浏览器 Cookie。</p>
+        </div>
+      </div>
+
+      <label>页面 URL 或数字页面 ID</label>
+      <input type="text" name="page" required placeholder="https://example.atlassian.net/wiki/spaces/X/pages/123/My+Page">
+
+      <label>输出目录</label>
+      <input type="text" name="output" placeholder="桌面/Confluence Export（默认）">
+
+      <div class="opts">
+        <label class="check"><input type="checkbox" name="attachments"> 下载附件</label>
+        <label class="check"><input type="checkbox" name="overwrite"> 覆盖已下载文件</label>
+        <label>最大递归深度 <input type="number" name="max_depth" min="0" placeholder="(无)"></label>
+        <label>总下载限速（MB/s） <input type="number" name="max_bandwidth_mb_s" min="0.001" step="0.001" placeholder="不限速"></label>
+      </div>
+      <div class="save-note">默认保留已有页面文件，图片和附件只补下载缺失项；勾选覆盖后会替换已有文件。</div>
+
+      <div class="save-note">
+        表单参数（包括 API Token）保存在此浏览器的本机存储中。
+        <button type="button" class="secondary" id="clearSavedBtn">清除已保存参数</button>
+      </div>
+
+      <div class="actions">
+        <button type="submit" id="runBtn">开始下载</button>
+        <button type="button" id="cancelBtn" disabled>取消</button>
+        <span id="status" class="status">空闲</span>
+      </div>
+    </form>
+  </div>
+
+  <div class="card" id="progressCard" hidden>
+    <div>
+      当前正在处理：<b id="curTitle">—</b>
+      <span class="pill" id="curPage">0 / 0 页</span>
+      <span class="pill" id="curAssets">0 资源</span>
+    </div>
+    <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+    <div class="counters">
+      <span>已下载：<b id="cntPages">0</b> 页</span>
+      <span>已跳过：<b id="cntSkippedPages">0</b> 页</span>
+      <span>已下载：<b id="cntImages">0</b> 张图</span>
+      <span>已下载：<b id="cntAttachments">0</b> 个附件</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <b>实时日志</b>
+      <span style="display:flex;align-items:center;gap:10px;">
+        <span class="status"><span id="logMeta">0 条事件</span></span>
+        <button type="button" class="secondary" id="downloadLogBtn">下载最近诊断日志</button>
+      </span>
+    </div>
+    <div class="save-note" style="margin:0 0 8px;">完整运行日志自动保存在项目 .runtime/logs 目录（保留最近 20 次，API Token 会自动遮蔽）。</div>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const form = document.getElementById('runForm');
+  const runBtn = document.getElementById('runBtn');
+  const cancelBtn = document.getElementById('cancelBtn');
+  const statusEl = document.getElementById('status');
+  const logEl = document.getElementById('log');
+  const logMeta = document.getElementById('logMeta');
+  const progressCard = document.getElementById('progressCard');
+  const curTitle = document.getElementById('curTitle');
+  const curPage = document.getElementById('curPage');
+  const curAssets = document.getElementById('curAssets');
+  const cntPages = document.getElementById('cntPages');
+  const cntImages = document.getElementById('cntImages');
+  const cntAttachments = document.getElementById('cntAttachments');
+  const progressBar = document.getElementById('progressBar');
+  const clearSavedBtn = document.getElementById('clearSavedBtn');
+  const downloadLogBtn = document.getElementById('downloadLogBtn');
+  const storageKey = 'confluence-dl.form.v1';
+  let evtCount = 0;
+  let total = 0;
+  let done = 0;
+  let activeController = null;
+
+  function saveFormState() {
+    const state = {};
+    for (const field of form.querySelectorAll('[name]')) {
+      state[field.name] = field.type === 'checkbox' ? field.checked : field.value;
+    }
+    try { localStorage.setItem(storageKey, JSON.stringify(state)); } catch (_) {}
+  }
+
+  function restoreFormState() {
+    try {
+      const state = JSON.parse(localStorage.getItem(storageKey) || '{}');
+      for (const field of form.querySelectorAll('[name]')) {
+        if (!(field.name in state)) continue;
+        if (field.type === 'checkbox') field.checked = Boolean(state[field.name]);
+        else field.value = state[field.name];
+      }
+    } catch (_) {}
+  }
+
+  restoreFormState();
+  form.addEventListener('input', saveFormState);
+  form.addEventListener('change', saveFormState);
+  clearSavedBtn.addEventListener('click', function () {
+    try { localStorage.removeItem(storageKey); } catch (_) {}
+    form.reset();
+  });
+
+  downloadLogBtn.addEventListener('click', async function () {
+    try {
+      const response = await fetch('/api/logs/latest');
+      if (!response.ok) throw new Error('暂无可下载的诊断日志');
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const filename = disposition.match(/filename="?([^";]+)"?/i);
+      link.download = filename ? filename[1] : 'confluence-dl-diagnostic.jsonl';
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setStatus('诊断日志下载失败：' + error.message, 'error');
+    }
+  });
+
+  function setStatus(text, klass) {
+    statusEl.textContent = text;
+    statusEl.className = 'status' + (klass ? ' ' + klass : '');
+  }
+
+  function appendLog(kind, payload) {
+    const ts = new Date().toTimeString().slice(0, 8);
+    const line = document.createElement('div');
+    const cls = kind === 'event'
+      ? 'evt'
+      : (kind === 'error' ? 'err' : (kind === 'stderr' ? 'warn' : ''));
+    line.innerHTML =
+      '<span class="ts">' + ts + '</span>' +
+      '<span class="' + cls + '">[' + kind + ']</span> ' +
+      escapeHtml(JSON.stringify(payload));
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+    evtCount++;
+    logMeta.textContent = evtCount + ' 条事件';
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  function applyEvent(evt) {
+    appendLog('event', evt);
+    const k = evt.kind;
+    if (k === 'started') {
+      progressCard.hidden = false;
+      setStatus('运行中…');
+    } else if (k === 'tree') {
+      total = evt.total || 0;
+      curPage.textContent = '0 / ' + total + ' 页';
+      progressBar.style.width = '0%';
+    } else if (k === 'page_start') {
+      if (evt.total && total === 0) {
+        total = evt.total;
+        curPage.textContent = done + ' / ' + total + ' 页';
+      }
+      if (evt.title) curTitle.textContent = evt.title;
+    } else if (k === 'page_done') {
+      if (evt.total) total = evt.total;
+      done++;
+      cntPages.textContent = (parseInt(cntPages.textContent, 10) || 0) + 1;
+      curPage.textContent = done + ' / ' + total + ' 页';
+      if (total > 0) {
+        progressBar.style.width = Math.min(100, (done / total) * 100).toFixed(1) + '%';
+      }
+    } else if (k === 'page_skipped') {
+      if (evt.total) total = evt.total;
+      done++;
+      const skipped = document.getElementById('cntSkippedPages');
+      skipped.textContent = (parseInt(skipped.textContent, 10) || 0) + 1;
+      curPage.textContent = done + ' / ' + total + ' 页';
+      if (total > 0) {
+        progressBar.style.width = Math.min(100, (done / total) * 100).toFixed(1) + '%';
+      }
+    } else if (k === 'asset') {
+      if (evt.asset_kind === 'image') {
+        cntImages.textContent = (parseInt(cntImages.textContent, 10) || 0) + 1;
+      } else if (evt.asset_kind === 'attachment') {
+        cntAttachments.textContent = (parseInt(cntAttachments.textContent, 10) || 0) + 1;
+      }
+      const img = parseInt(cntImages.textContent, 10) || 0;
+      const att = parseInt(cntAttachments.textContent, 10) || 0;
+      curAssets.textContent = (img + att) + ' 资源';
+    } else if (k === 'done') {
+      progressBar.style.width = '100%';
+      setStatus('下载完成', 'ok');
+    } else if (k === 'exit') {
+      const code = evt.code;
+      if (code === 0) {
+        setStatus('下载完成（退出码 0）', 'ok');
+      } else {
+        setStatus('下载失败（退出码 ' + code + '）', 'error');
+      }
+      runBtn.disabled = false;
+      cancelBtn.disabled = true;
+      activeController = null;
+    } else if (k === 'closed') {
+      // stream fully closed by server
+    }
+  }
+
+  form.addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    if (activeController) return;
+    const fd = new FormData(form);
+    const body = {
+      site: fd.get('site'),
+      user: fd.get('user'),
+      token: fd.get('token'),
+      page: fd.get('page'),
+      output: fd.get('output') || '',
+      attachments: fd.get('attachments') === 'on',
+      overwrite: fd.get('overwrite') === 'on',
+      max_depth: fd.get('max_depth') || null,
+      max_bandwidth_mb_s: fd.get('max_bandwidth_mb_s') || null,
+    };
+    // reset counters + UI
+    logEl.innerHTML = '';
+    evtCount = 0;
+    total = 0;
+    done = 0;
+    cntPages.textContent = '0';
+    document.getElementById('cntSkippedPages').textContent = '0';
+    cntImages.textContent = '0';
+    cntAttachments.textContent = '0';
+    curTitle.textContent = '—';
+    curPage.textContent = '0 / 0 页';
+    curAssets.textContent = '0 资源';
+    progressBar.style.width = '0%';
+    logMeta.textContent = '0 条事件';
+    progressCard.hidden = false;
+    setStatus('启动中…');
+
+    runBtn.disabled = true;
+    cancelBtn.disabled = false;
+
+    activeController = new AbortController();
+    try {
+      const resp = await fetch('/api/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: activeController.signal,
+      });
+      if (!resp.ok || !resp.body) {
+        const err = await resp.text();
+        setStatus('启动失败：' + err, 'error');
+        runBtn.disabled = false;
+        cancelBtn.disabled = true;
+        activeController = null;
+        return;
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { value, done: rdDone } = await reader.read();
+        if (rdDone) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buffer.indexOf('\n\n')) !== -1) {
+          const raw = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          parseSSE(raw);
+        }
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') {
+        setStatus('网络错误：' + e.message, 'error');
+        appendLog('error', { message: e.message });
+      } else {
+        setStatus('已取消', 'error');
+      }
+      runBtn.disabled = false;
+      cancelBtn.disabled = true;
+      activeController = null;
+    }
+  });
+
+  function parseSSE(raw) {
+    let event = 'message';
+    const dataLines = [];
+    for (const line of raw.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+    }
+    if (!dataLines.length) return;
+    let payload;
+    try { payload = JSON.parse(dataLines.join('\n')); }
+    catch { payload = { raw: dataLines.join('\n') }; }
+    if (event === 'event') applyEvent(payload);
+    else if (event === 'stderr' || event === 'stdout' || event === 'exit' || event === 'closed' || event === 'started' || event === 'error') {
+      applyEvent({ kind: event, ...payload });
+    } else {
+      appendLog(event, payload);
+    }
+  }
+
+  cancelBtn.addEventListener('click', function () {
+    if (activeController) {
+      activeController.abort();
+      setStatus('正在取消…');
+    }
+  });
+})();
+</script>
+</body>
+</html>
