@@ -1,0 +1,86 @@
+name: Build portable Windows package
+on:
+  push:
+    branches: [portable-windows-build]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: cargo +stable build --release --locked
+      - run: python -m pip install aiohttp pyinstaller
+      - name: Build portable server
+        shell: pwsh
+        run: |
+          $code = Get-Content web_server.py -Raw
+          $code = $code.Replace('import argparse', "import sys`nimport argparse")
+          $code = $code.Replace('ROOT = Path(__file__).resolve().parent', 'ROOT = Path(sys.executable).resolve().parent.parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent')
+          [IO.File]::WriteAllText("$pwd/server_bundle.py", $code, [Text.UTF8Encoding]::new($false))
+          pyinstaller --noconfirm --onedir --name web-service server_bundle.py
+          New-Item -ItemType Directory -Force package/Confluence-Downloader/target/release, package/Confluence-Downloader/web | Out-Null
+          Copy-Item -Recurse dist/web-service package/Confluence-Downloader/
+          Copy-Item target/release/confluence-dl.exe package/Confluence-Downloader/target/release/
+          Copy-Item web/index.html package/Confluence-Downloader/web/
+          Copy-Item LICENSE package/Confluence-Downloader/
+          @'
+          @echo off
+          cd /d "%~dp0"
+          powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1"
+          if errorlevel 1 pause
+          '@ | Set-Content package/Confluence-Downloader/start.cmd -Encoding ascii
+          @'
+          @echo off
+          cd /d "%~dp0"
+          powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0stop.ps1"
+          pause
+          '@ | Set-Content package/Confluence-Downloader/stop.cmd -Encoding ascii
+          @'
+          $ErrorActionPreference = 'Stop'
+          Set-Location $PSScriptRoot
+          New-Item -ItemType Directory -Force .runtime | Out-Null
+          if (Get-NetTCPConnection -LocalPort 18770 -State Listen -ErrorAction SilentlyContinue) { Write-Host 'Port 18770 is in use. Stop the existing service first.'; exit 1 }
+          $p = Start-Process -FilePath "$PSScriptRoot\web-service\web-service.exe" -ArgumentList '--host','127.0.0.1','--port','18770' -WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$PSScriptRoot\.runtime\web.log" -RedirectStandardError "$PSScriptRoot\.runtime\error.log" -PassThru -WindowStyle Hidden
+          $p.Id | Set-Content .runtime/web.pid
+          for ($i=0; $i -lt 40; $i++) {
+            Start-Sleep -Milliseconds 250
+            try { Invoke-WebRequest http://127.0.0.1:18770/ -UseBasicParsing | Out-Null; Start-Process http://127.0.0.1:18770/; Write-Host 'Service started. Use stop.cmd to stop it.'; exit 0 } catch {}
+          }
+          Write-Host 'Start failed. See .runtime/error.log'; exit 1
+          '@ | Set-Content package/Confluence-Downloader/start.ps1 -Encoding ascii
+          @'
+          Set-Location $PSScriptRoot
+          if (Test-Path .runtime/web.pid) {
+            $serviceId = 0
+            if ([int]::TryParse((Get-Content .runtime/web.pid -Raw).Trim(), [ref]$serviceId)) {
+              $p = Get-CimInstance Win32_Process -Filter "ProcessId=$serviceId"
+              if ($p -and $p.ExecutablePath -eq "$PSScriptRoot\web-service\web-service.exe") { Stop-Process -Id $serviceId; Write-Host 'Service stopped.' } else { Write-Host 'Service is not running.' }
+            }
+            Remove-Item .runtime/web.pid -ErrorAction SilentlyContinue
+          } else { Write-Host 'Service is not running.' }
+          '@ | Set-Content package/Confluence-Downloader/stop.ps1 -Encoding ascii
+          @'
+          Windows 10/11 x64. Extract the entire ZIP, then double-click start.cmd.
+          The browser opens at http://127.0.0.1:18770/. Double-click stop.cmd to stop.
+          Internet access and valid Confluence credentials are required.
+          Logs are stored in .runtime. Keep the folder writable.
+          '@ | Set-Content package/Confluence-Downloader/README.txt -Encoding ascii
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          & package/Confluence-Downloader/target/release/confluence-dl.exe --version
+          $p = Start-Process -PassThru -FilePath "$pwd/package/Confluence-Downloader/web-service/web-service.exe" -ArgumentList '--host','127.0.0.1','--port','18770'
+          try {
+            $ready=$false
+            for($i=0;$i -lt 40;$i++){ Start-Sleep -Milliseconds 250; try { $r=Invoke-WebRequest http://127.0.0.1:18770/ -UseBasicParsing; if($r.StatusCode -eq 200 -and $r.Content -match 'confluence-dl') {$ready=$true; break} } catch {} }
+            if (!$ready) { throw 'Web server did not serve the UI' }
+          } finally { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          Compress-Archive -Path package/Confluence-Downloader -DestinationPath Confluence-Downloader-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Confluence-Downloader-Windows-x64
+          path: Confluence-Downloader-Windows-x64.zip
