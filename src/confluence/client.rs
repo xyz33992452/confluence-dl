@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use super::api::ConfluenceApi;
-use super::models::{Attachment, AttachmentsResponse, ChildPagesV2Response, Page, UserInfo};
+use super::models::{Attachment, AttachmentsResponse, Page, UserInfo};
 
 /// Maximum number of pagination requests before aborting, as a safeguard
 /// against infinite loops caused by cyclic or malformed `next` links.
@@ -211,6 +211,29 @@ impl ConfluenceClient {
 #[async_trait]
 impl ConfluenceApi for ConfluenceClient {
   async fn get_page(&self, page_id: &str) -> Result<Page> {
+    if let Some(id) = page_id.strip_prefix("folder:") {
+      self.rate_limiter.acquire().await;
+      let response = self
+        .client
+        .get(format!("{}/wiki/api/v2/folders/{}", self.base_url, id))
+        .header("Authorization", self.auth_header())
+        .send()
+        .await?;
+      let status = response.status();
+      if !status.is_success() {
+        return Err(anyhow!("Folder API returned {status}: {}", response.text().await?));
+      }
+      let value: serde_json::Value = response.json().await?;
+      return Ok(Page {
+        id: page_id.to_string(),
+        title: value["title"].as_str().context("Folder title missing")?.to_string(),
+        page_type: "folder".into(),
+        status: "current".into(),
+        body: None,
+        space: None,
+        links: None,
+      });
+    }
     self.rate_limiter.acquire().await;
 
     let url = format!(
@@ -245,7 +268,14 @@ impl ConfluenceApi for ConfluenceClient {
   }
 
   async fn get_child_pages(&self, page_id: &str) -> Result<Vec<Page>> {
-    let initial_url = format!("{}/wiki/api/v2/pages/{}/children?limit=100", self.base_url, page_id);
+    let initial_url = if let Some(id) = page_id.strip_prefix("folder:") {
+      format!("{}/wiki/api/v2/folders/{id}/direct-children?limit=100", self.base_url)
+    } else {
+      format!(
+        "{}/wiki/api/v2/pages/{page_id}/direct-children?limit=100",
+        self.base_url
+      )
+    };
     let mut all_pages = Vec::new();
     let mut next_url = Some(initial_url);
     let mut seen_urls = HashSet::new();
@@ -283,16 +313,35 @@ impl ConfluenceApi for ConfluenceClient {
         return Err(anyhow!("Confluence API returned error {status}: {error_text}"));
       }
 
-      let child_pages: ChildPagesV2Response = response
+      let child_pages: serde_json::Value = response
         .json()
         .await
         .context("Failed to parse child pages response from Confluence REST API v2")?;
 
-      all_pages.extend(child_pages.results.into_iter().map(Page::from));
-      next_url = child_pages
-        .links
-        .and_then(|l| l.next)
-        .map(|next| self.resolve_pagination_url(&next));
+      for child in child_pages["results"].as_array().context("Missing children results")? {
+        let kind = child["type"].as_str().unwrap_or("page");
+        if kind != "page" && kind != "folder" {
+          eprintln!("Warning: Unsupported content type {kind}: {}", child["title"]);
+          continue;
+        }
+        let id = child["id"].as_str().context("Missing child ID")?;
+        all_pages.push(Page {
+          id: if kind == "folder" {
+            format!("folder:{id}")
+          } else {
+            id.to_string()
+          },
+          title: child["title"].as_str().context("Missing child title")?.to_string(),
+          page_type: kind.into(),
+          status: "current".into(),
+          body: None,
+          space: None,
+          links: None,
+        });
+      }
+      next_url = child_pages["_links"]["next"]
+        .as_str()
+        .map(|next| self.resolve_pagination_url(next));
     }
 
     Ok(all_pages)
@@ -560,10 +609,41 @@ mod tests {
     let pages = client.get_child_pages("100").await.unwrap();
     let request = server.join().unwrap();
 
-    assert!(request.starts_with("GET /wiki/api/v2/pages/100/children?limit=100 HTTP/1.1"));
+    assert!(request.starts_with("GET /wiki/api/v2/pages/100/direct-children?limit=100 HTTP/1.1"));
     assert_eq!(pages.len(), 1);
     assert_eq!(pages[0].id, "42");
     assert_eq!(pages[0].page_type, "page");
+  }
+
+  #[tokio::test]
+  async fn folder_children_follow_pagination_and_preserve_types() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+      let mut requests = Vec::new();
+      for body in [
+        r#"{"results":[{"id":"2","title":"Nested","type":"folder"}],"_links":{"next":"/wiki/api/v2/folders/1/direct-children?cursor=next"}}"#,
+        r#"{"results":[{"id":"3","title":"Document","type":"page"}],"_links":{}}"#,
+      ] {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0u8; 2048];
+        let n = stream.read(&mut buffer).unwrap();
+        requests.push(String::from_utf8_lossy(&buffer[..n]).to_string());
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+      }
+      requests
+    });
+    let client = ConfluenceClient::new(format!("http://{address}"), "user", "token", 30, 100).unwrap();
+    let children = client.get_child_pages("folder:1").await.unwrap();
+    let requests = server.join().unwrap();
+    assert!(requests[0].starts_with("GET /wiki/api/v2/folders/1/direct-children?limit=100 "));
+    assert!(requests[1].starts_with("GET /wiki/api/v2/folders/1/direct-children?cursor=next "));
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0].id, "folder:2");
+    assert_eq!(children[0].page_type, "folder");
+    assert_eq!(children[1].id, "3");
   }
 
   #[tokio::test]

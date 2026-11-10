@@ -143,7 +143,7 @@ async fn download_page(page_input: &str, cli: &Cli, colors: &ColorScheme, sink: 
   };
 
   // Check if we should download children
-  if cli.page.children {
+  if cli.page.children || url_info.page_id.starts_with("folder:") {
     println!("{} {}", colors.info("→"), colors.info("Fetching page tree"));
 
     let max_depth = cli.page.max_depth;
@@ -396,6 +396,15 @@ fn download_page_tree<'a>(
       .map_err(|_| anyhow::anyhow!("Parallel download limiter became unavailable"))?;
 
     let page = &tree.page;
+    if page.page_type == "folder" {
+      let folder_dir = output_dir.join(sanitize_filename(&page.title));
+      fs::create_dir_all(&folder_dir)?;
+      drop(permit);
+      for child in &tree.children {
+        download_page_tree(client, child, &folder_dir, cli, colors, Arc::clone(&semaphore), sink).await?;
+      }
+      return Ok(());
+    }
 
     sink.emit(Event {
       kind: "page_start",
@@ -565,7 +574,7 @@ fn build_asciidoc_options(cli: &Cli) -> AsciiDocOptions {
 
 /// Count the number of pages represented inside a [`confluence::PageTree`].
 fn count_pages_in_tree(tree: &confluence::PageTree) -> usize {
-  1 + tree.children.iter().map(count_pages_in_tree).sum::<usize>()
+  usize::from(tree.page.page_type != "folder") + tree.children.iter().map(count_pages_in_tree).sum::<usize>()
 }
 
 #[cfg(test)]
@@ -798,6 +807,95 @@ mod tests {
     let raw_file = output_dir.join("Root Page.raw.xml");
     assert!(raw_file.exists(), "raw storage file should be created");
     assert_eq!(fs::read_to_string(&raw_file).unwrap(), "<p>Example</p>");
+  }
+
+  #[tokio::test]
+  async fn download_folder_tree_exports_only_pages() {
+    let temp_dir = tempdir().unwrap();
+    let output_dir = temp_dir.path();
+
+    let counter = Arc::new(Mutex::new(0));
+    let max_counter = Arc::new(Mutex::new(0));
+    let client = CountingClient::new(
+      Arc::clone(&counter),
+      Arc::clone(&max_counter),
+      Duration::from_millis(10),
+    );
+
+    let mut folder = make_page("folder:1", "Definitions");
+    folder.page_type = "folder".into();
+    folder.body = None;
+    let tree = PageTree {
+      page: folder.clone(),
+      children: vec![PageTree {
+        page: Page { title: "Nested".into(), id: "folder:2".into(), ..folder },
+        children: vec![PageTree { page: make_page("3", "Document"), children: vec![], depth: 2 }],
+        depth: 1,
+      }],
+      depth: 0,
+    };
+    assert_eq!(count_pages_in_tree(&tree), 1);
+
+    let colors = ColorScheme::new(ColorOption::Never);
+    let cli = Cli {
+      page_input: None,
+      command: None,
+      auth: AuthOptions {
+        url: None,
+        user: None,
+        token: None,
+      },
+      output: OutputOptions {
+        output: output_dir.to_string_lossy().to_string(),
+        overwrite: true,
+        save_raw: true,
+        compact_tables: false,
+        format: OutputFormat::Markdown,
+      },
+      behavior: BehaviorOptions {
+        dry_run: false,
+        verbose: 0,
+        quiet: true,
+        color: ColorOption::Never,
+        json_events: false,
+      },
+      page: PageOptions {
+        children: true,
+        max_depth: None,
+        attachments: false,
+      },
+      images_links: ImagesLinksOptions {
+        download_images: false,
+        images_dir: "images".to_string(),
+        preserve_anchors: false,
+      },
+      performance: PerformanceOptions {
+        parallel: 2,
+        rate_limit: 10,
+        timeout: 30,
+        max_bandwidth_mb_s: None,
+      },
+    };
+
+    let semaphore = Arc::new(Semaphore::new(cli.performance.resolved_parallel()));
+    download_page_tree(
+      &client,
+      &tree,
+      output_dir,
+      &cli,
+      &colors,
+      semaphore,
+      &EventSink::to_stderr(false),
+    )
+    .await
+    .expect("download should succeed");
+
+    let raw_file = output_dir.join("Definitions/Nested/Document.raw.xml");
+    assert!(raw_file.exists(), "raw storage file should be created");
+    assert_eq!(fs::read_to_string(&raw_file).unwrap(), "<p>Example</p>");
+    assert!(output_dir.join("Definitions/Nested/Document.md").is_file());
+    assert!(!output_dir.join("Definitions.md").exists());
+    assert!(!output_dir.join("Definitions/Nested.md").exists());
   }
 
   #[tokio::test]

@@ -45,7 +45,7 @@ pub fn parse_confluence_url(url: &str) -> Result<UrlInfo> {
 
   let page_id_pos = segments
     .iter()
-    .position(|&s| s == "pages")
+    .position(|&s| s == "pages" || s == "folder")
     .context("URL does not contain 'pages' segment")?;
 
   if page_id_pos + 1 >= segments.len() {
@@ -68,7 +68,11 @@ pub fn parse_confluence_url(url: &str) -> Result<UrlInfo> {
 
   Ok(UrlInfo {
     base_url,
-    page_id: page_id.to_string(),
+    page_id: if segments[page_id_pos] == "folder" {
+      format!("folder:{page_id}")
+    } else {
+      page_id.to_string()
+    },
     space_key,
   })
 }
@@ -76,6 +80,13 @@ pub fn parse_confluence_url(url: &str) -> Result<UrlInfo> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn parses_folder_url() {
+    let info = parse_confluence_url("https://example.atlassian.net/wiki/spaces/PMPL/folder/2141552737").unwrap();
+    assert_eq!(info.page_id, "folder:2141552737");
+    assert_eq!(info.space_key.as_deref(), Some("PMPL"));
+  }
 
   #[test]
   fn test_parse_confluence_url_with_space() {
